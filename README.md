@@ -131,21 +131,6 @@ To extend or productionize this project:
 This project is released under the [MIT License](LICENSE).
 Feel free to use, modify, and share it for learning or real-world applications.
 
----
-
-**Author:** *Your Name*
-💡 *“Good recommendations are built on great data and even better pipelines.”*
-
-```
-
----
-
-Would you like me to:
-- Add a **badges section** (Python version, License, Build Status, etc.) for a more GitHub-professional look,  
-or  
-- Keep it minimal and clean for educational use?
-```
-
 ```markdown
 # MovieLens Recommendation System Project
 
