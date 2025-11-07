@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+.idea/
+.vscode/
+data/raw/
+data/processed/
+models/
+notebooks/*.ipynb_checkpoints/
+*.npz
+*.pkl
+.DS_Store
