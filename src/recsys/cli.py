@@ -1,106 +1,125 @@
-"""Command line interface for the recommendation system project."""
+"""Utilities for downloading and preparing the MovieLens dataset."""
 from __future__ import annotations
 
 import json
 import logging
+import shutil
+import zipfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from collections import Counter
+from typing import Dict, Iterable, List, Tuple
 
-import typer
+import pandas as pd
+import requests
+from lightfm.data import Dataset
+from scipy import sparse
+from tqdm import tqdm
 
-from . import config, data, model
+from . import config
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
-app = typer.Typer(help="MovieLens recommendation system reference project")
-
-
-@app.command()
-def download(force: bool = typer.Option(False, help="Redownload the dataset even if it exists.")) -> None:
-    """Download the MovieLens dataset."""
-    path = data.download_movielens(force=force)
-    typer.echo(f"Dataset available at {path}")
+LOGGER = logging.getLogger(__name__)
 
 
-@app.command()
-def prepare(
-    min_ratings_per_user: int = typer.Option(
-        config.DEFAULT_MIN_RATINGS_PER_USER,
-        help="Minimum number of ratings per user to keep.",
-    ),
-    min_rating: float = typer.Option(
-        config.DEFAULT_MIN_RATING,
-        help="Minimum rating value to keep",
-    ),
-    force_download: bool = typer.Option(False, help="Force re-downloading the dataset."),
-) -> None:
-    """Prepare the dataset and persist the processed artefacts."""
-    prepared = data.prepare_dataset(
-        min_ratings_per_user=min_ratings_per_user,
-        min_rating=min_rating,
-        force_download=force_download,
+@dataclass
+class PreparedData:
+    """Container for all artefacts required to train and evaluate the model."""
+
+    dataset: Dataset
+    train_interactions: sparse.coo_matrix
+    test_interactions: sparse.coo_matrix
+    item_features: sparse.csr_matrix
+    metadata: Dict[str, object]
+
+
+def _download_file(url: str, destination: Path) -> None:
+    """Download a file with progress bar."""
+    response = requests.get(url, stream=True, timeout=30)
+    response.raise_for_status()
+    total = int(response.headers.get("content-length", 0))
+    with open(destination, "wb") as file, tqdm(
+        total=total, unit="B", unit_scale=True, desc=destination.name
+    ) as progress:
+        for chunk in response.iter_content(chunk_size=8192):
+            file.write(chunk)
+            progress.update(len(chunk))
+
+
+def _filter_users(
+    ratings: pd.DataFrame, min_ratings_per_user: int, min_rating: float
+) -> pd.DataFrame:
+    """Filter users with few ratings and low scores."""
+    ratings = ratings[ratings["rating"] >= min_rating]
+    counts = ratings.groupby("userId")["movieId"].count()
+    valid_users = counts[counts >= min_ratings_per_user].index
+    filtered = ratings[ratings["userId"].isin(valid_users)]
+    return filtered
+
+
+def _train_test_split(ratings: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    ratings = ratings.sort_values(["userId", "timestamp"])
+    test = ratings.groupby("userId").tail(1)
+    train = ratings.drop(test.index)
+    return train, test
+
+
+def _extract_genre_features(movies: pd.DataFrame) -> Tuple[List[str], Iterable[Tuple[int, List[str]]]]:
+    all_genres = set()
+    item_features = []
+    for row in movies.itertuples(index=False):
+        genres = []
+        if isinstance(row.genres, str):
+            for genre in row.genres.split("|"):
+                genre = genre.strip()
+                if genre and genre.lower() != "(no genres listed)":
+                    feature = f"genre:{genre.lower()}"
+                    genres.append(feature)
+                    all_genres.add(feature)
+        item_features.append((row.movieId, genres))
+    return sorted(all_genres), item_features
+
+
+def _summarise_dataset(
+    filtered: pd.DataFrame,
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    movies: pd.DataFrame,
+) -> Dict[str, object]:
+    """Create high-level summary statistics for the prepared dataset."""
+
+    num_users = int(filtered["userId"].nunique())
+    num_items = int(filtered["movieId"].nunique())
+
+    rating_stats = filtered["rating"].agg(["min", "max", "mean", "median"])  # type: ignore[call-overload]
+    rating_summary = {
+        "min": float(rating_stats["min"]),
+        "max": float(rating_stats["max"]),
+        "mean": float(rating_stats["mean"]),
+        "median": float(rating_stats["median"]),
+    }
+
+    merged = filtered.merge(
+        movies[["movieId", "title", "genres"]], on="movieId", how="left"
     )
-    typer.echo(
-        "Prepared dataset with "
-        f"{prepared.train_interactions.shape[0]} users and "
-        f"{prepared.train_interactions.shape[1]} items."
-    )
 
+    genre_counter: Counter[str] = Counter()
+    for genres in merged["genres"].dropna():
+        for genre in str(genres).split("|"):
+            genre = genre.strip()
+            if genre and genre.lower() != "(no genres listed)":
+                genre_counter[genre] += 1
 
-@app.command()
-def train(
-    num_components: int = typer.Option(64, help="Number of latent factors."),
-    learning_rate: float = typer.Option(0.05, help="Learning rate for the optimizer."),
-    loss: str = typer.Option("warp", help="Loss function (warp, bpr, logistic)."),
-    epochs: int = typer.Option(30, help="Number of training epochs."),
-    num_threads: int = typer.Option(4, help="Number of CPU threads to use."),
-) -> None:
-    """Train the LightFM model and save it to disk."""
-    prepared = data.load_prepared_data()
-    training_config = model.TrainingConfig(
-        num_components=num_components,
-        learning_rate=learning_rate,
-        loss=loss,
-        epochs=epochs,
-        num_threads=num_threads,
-    )
+    top_genres = [
+        {"genre": genre, "count": int(count)}
+        for genre, count in genre_counter.most_common(5)
+    ]
 
-    trained_model = model.train_model(prepared, training_config)
-    model_path = model.save_model(trained_model)
-    results = model.evaluate_model(trained_model, prepared)
-
-    typer.echo(f"Model saved to {model_path}")
-    typer.echo(
-        json.dumps(
-            {
-                "precision_at_k": results.precision_at_k,
-                "recall_at_k": results.recall_at_k,
-                "auc": results.auc,
-            },
-            indent=2,
-        )
-    )
-
-
-@app.command()
-def evaluate(k: int = typer.Option(config.DEFAULT_TOP_K, help="Cutoff for precision/recall.")) -> None:
-    """Evaluate the most recently trained model."""
-    prepared = data.load_prepared_data()
-    trained_model = model.load_model()
-    results = model.evaluate_model(trained_model, prepared, k=k)
-    typer.echo(
-        json.dumps(
-            {
-                "precision_at_k": results.precision_at_k,
-                "recall_at_k": results.recall_at_k,
-                "auc": results.auc,
-            },
-            indent=2,
-        )
-    )
-
-
-@app.command()
+    movie_counts = (
+        merged.groupby(["movieId", "title"], dropna=False)["rating"]
+        .count()
+        .sort_values(ascending=False)
+        .head(5)
+    )@app.command()
 def describe(as_json: bool = typer.Option(False, help="Emit dataset summary as JSON.")) -> None:
     """Show descriptive statistics for the processed dataset."""
     prepared = data.load_prepared_data()
@@ -157,28 +176,127 @@ def describe(as_json: bool = typer.Option(False, help="Emit dataset summary as J
             )
 
 
-@app.command()
-def recommend(
-    user_id: int = typer.Argument(..., help="User ID from the dataset."),
-    k: int = typer.Option(config.DEFAULT_TOP_K, help="Number of recommendations to return."),
-    export: Optional[Path] = typer.Option(None, help="Optional path to export recommendations as JSON."),
-) -> None:
-    """Generate personalised movie recommendations for a user."""
-    prepared = data.load_prepared_data()
-    trained_model = model.load_model()
-    recommendations = model.recommend_for_user(trained_model, prepared, user_id=user_id, k=k)
+    top_movies = [
+        {
+            "movie_id": int(movie_id),
+            "title": title if isinstance(title, str) else "Unknown",
+            "ratings": int(count),
+        }
+        for (movie_id, title), count in movie_counts.items()
+    ]
 
-    if not recommendations:
-        typer.echo("No recommendations available. Try training the model first.")
-        raise typer.Exit(code=1)
+    total_interactions = int(filtered.shape[0])
+    train_interactions = int(train.shape[0])
+    test_interactions = int(test.shape[0])
 
-    if export:
-        model.export_recommendations(recommendations, export)
-        typer.echo(f"Recommendations exported to {export}")
-    else:
-        for index, item in enumerate(recommendations, start=1):
-            typer.echo(f"{index}. {item['title']} (movie_id={item['movie_id']}) -> score={item['score']:.3f}")
+    sparsity = 1.0 - (
+        train_interactions / float(max(num_users * num_items, 1))
+    )
+
+    return {
+        "users": num_users,
+        "items": num_items,
+        "interactions": {
+            "total": total_interactions,
+            "train": train_interactions,
+            "test": test_interactions,
+        },
+        "rating_distribution": rating_summary,
+        "sparsity": float(sparsity),
+        "top_genres": top_genres,
+        "top_movies": top_movies,
+    }
 
 
-if __name__ == "__main__":
-    app()
+def _build_dataset(
+    filtered: pd.DataFrame,
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    movies: pd.DataFrame,
+) -> PreparedData:
+    dataset = Dataset()
+
+    genres, item_feature_tuples = _extract_genre_features(movies)
+    dataset.fit(
+        users=train["userId"].unique(),
+        items=train["movieId"].unique(),
+        item_features=genres,
+    )
+
+    item_features = dataset.build_item_features(item_feature_tuples).tocsr()
+
+    def _build_interactions(frame: pd.DataFrame) -> sparse.coo_matrix:
+        interactions, _ = dataset.build_interactions(
+            (row.userId, row.movieId, float(row.rating))
+            for row in frame.itertuples(index=False)
+        )
+        return interactions.tocoo()
+
+    train_interactions = _build_interactions(train)
+    test_interactions = _build_interactions(test)
+
+    user_id_map, user_feature_map, item_id_map, item_feature_map = dataset.mapping()
+
+    metadata = {
+        "user_id_map": {str(key): int(value) for key, value in user_id_map.items()},
+        "item_id_map": {str(key): int(value) for key, value in item_id_map.items()},
+        "id_to_user": {str(int(value)): str(key) for key, value in user_id_map.items()},
+        "id_to_item": {str(int(value)): int(key) for key, value in item_id_map.items()},
+        "item_feature_map": {
+            str(key): value for key, value in item_feature_map.items()
+        },
+        "movie_titles": {
+            str(int(row.movieId)): row.title for row in movies.itertuples(index=False)
+        },
+        "movies": movies.to_dict(orient="records"),
+        "summary": _summarise_dataset(filtered, train, test, movies),
+    }
+
+    return PreparedData(
+        dataset=dataset,
+        train_interactions=train_interactions,
+        test_interactions=test_interactions,
+        item_features=item_features,
+        metadata=metadata,
+    )
+
+
+def prepare_dataset(
+    min_ratings_per_user: int = config.DEFAULT_MIN_RATINGS_PER_USER,
+    min_rating: float = config.DEFAULT_MIN_RATING,
+    force_download: bool = False,
+) -> PreparedData:
+    """Prepare the MovieLens dataset for training."""
+    dataset_dir = download_movielens(force=force_download)
+
+    ratings = _load_ratings(dataset_dir)
+    movies = pd.read_csv(dataset_dir / "movies.csv")
+
+    filtered = _filter_users(ratings, min_ratings_per_user, min_rating)
+    train, test = _train_test_split(filtered)
+
+    prepared = _build_dataset(filtered, train, test, movies)
+
+    _persist_prepared_data(prepared)
+    return prepared
+
+
+def _persist_prepared_data(prepared: PreparedData) -> None:
+    config.ensure_directories()
+    sparse.save_npz(config.PROCESSED_DATA_DIR / "train_interactions.npz", prepared.train_interactions)
+    sparse.save_npz(config.PROCESSED_DATA_DIR / "test_interactions.npz", prepared.test_interactions)
+    sparse.save_npz(config.PROCESSED_DATA_DIR / "item_features.npz", prepared.item_features)
+
+    metadata_path = config.PROCESSED_DATA_DIR / "metadata.json"
+    with open(metadata_path, "w", encoding="utf-8") as file:
+        json.dump(prepared.metadata, file, indent=2)
+
+
+def load_prepared_data() -> PreparedData:
+    """Load prepared artefacts from disk."""
+    config.ensure_directories()
+    metadata_path = config.PROCESSED_DATA_DIR / "metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            "Processed data not found. Run the 'prepare' command first."
+        )
