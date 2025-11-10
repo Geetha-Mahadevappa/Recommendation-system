@@ -101,6 +101,63 @@ def evaluate(k: int = typer.Option(config.DEFAULT_TOP_K, help="Cutoff for precis
 
 
 @app.command()
+def describe(as_json: bool = typer.Option(False, help="Emit dataset summary as JSON.")) -> None:
+    """Show descriptive statistics for the processed dataset."""
+    prepared = data.load_prepared_data()
+    summary = prepared.metadata.get("summary")
+    if summary is None:
+        typer.echo(
+            "Summary statistics are unavailable. Prepare the dataset to generate them."
+        )
+        raise typer.Exit(code=1)
+
+    if as_json:
+        typer.echo(json.dumps(summary, indent=2))
+        return
+
+    interactions = summary.get("interactions", {})
+    ratings = summary.get("rating_distribution", {})
+
+    typer.echo("Dataset summary:")
+    typer.echo(f"  Users: {summary.get('users', 'unknown')}")
+    typer.echo(f"  Items: {summary.get('items', 'unknown')}")
+    typer.echo("  Interactions:")
+    typer.echo(f"    Total: {interactions.get('total', 'unknown')}")
+    typer.echo(f"    Train: {interactions.get('train', 'unknown')}")
+    typer.echo(f"    Test: {interactions.get('test', 'unknown')}")
+    typer.echo("  Rating distribution:")
+    typer.echo(
+        "    Min={min:.2f} Max={max:.2f} Mean={mean:.2f} Median={median:.2f}".format(
+            min=ratings.get("min", 0.0),
+            max=ratings.get("max", 0.0),
+            mean=ratings.get("mean", 0.0),
+            median=ratings.get("median", 0.0),
+        )
+    )
+    sparsity = summary.get("sparsity")
+    if isinstance(sparsity, float):
+        typer.echo(f"  Matrix sparsity: {sparsity:.4f}")
+
+    top_genres = summary.get("top_genres") or []
+    if top_genres:
+        typer.echo("  Top genres:")
+        for genre in top_genres:
+            typer.echo(f"    {genre.get('genre')}: {genre.get('count')}")
+
+    top_movies = summary.get("top_movies") or []
+    if top_movies:
+        typer.echo("  Most-rated movies:")
+        for movie in top_movies:
+            typer.echo(
+                "    {title} (movie_id={movie_id}) – ratings={ratings}".format(
+                    title=movie.get("title"),
+                    movie_id=movie.get("movie_id"),
+                    ratings=movie.get("ratings"),
+                )
+            )
+
+
+@app.command()
 def recommend(
     user_id: int = typer.Argument(..., help="User ID from the dataset."),
     k: int = typer.Option(config.DEFAULT_TOP_K, help="Number of recommendations to return."),
