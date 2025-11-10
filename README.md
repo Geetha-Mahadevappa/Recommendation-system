@@ -13,7 +13,8 @@ It demonstrates a modern hybrid collaborative filtering approach using the [Ligh
 
 - **Automated data pipeline** – Download, extract, and preprocess the MovieLens data with a single command.  
 - **Hybrid recommender** – Train a LightFM model that blends collaborative filtering with content-based genre features.  
-- **Command-line interface (CLI)** – Reproducible commands for preparing data, training, evaluating, and generating personalized recommendations.  
+- **Command-line interface (CLI)** – Reproducible commands for preparing data, training, evaluating, and generating personalized recommendations.
+- **Dataset insights** – Quickly inspect dataset health with built-in descriptive statistics.
 - **Extensible architecture** – Modular Python package, ready for experimentation with different datasets or models.  
 
 ---
@@ -29,7 +30,7 @@ python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 export PYTHONPATH="$(pwd)/src"  # Ensures the recsys package is importable
-````
+`````
 
 ---
 
@@ -64,6 +65,14 @@ To view all options:
 python -m recsys.cli --help
 ```
 
+Once the data has been prepared you can inspect dataset statistics:
+
+```bash
+python -m recsys.cli describe
+```
+
+Add `--as-json` to the command above to export the summary in machine-readable form.
+
 ---
 
 ### 4️⃣ Generate recommendations
@@ -89,40 +98,6 @@ python -m recsys.cli recommend 1 --k 5 --export output.json
 .
 ├── requirements.txt          # Python dependencies (LightFM, pandas, Typer, ...)
 ├── src/
-│   └── recsys/
-│       ├── cli.py            # Typer-based command-line interface
-│       ├── config.py         # Shared paths and configuration constants
-│       ├── data.py           # Downloading, filtering, and interaction matrix builders
-│       ├── evaluation.py     # Evaluation metrics and helper functions
-│       └── model.py          # Training loop, evaluation, persistence, recommendations
-├── data/                     # Generated datasets (ignored by Git)
-├── models/                   # Persisted LightFM weights (ignored by Git)
-└── notebooks/                # Optional notebooks or experiments (ignored by Git)
 ```
 
 ---
-
-## ⚙️ Customization
-
-You can tweak several pipeline parameters easily:
-
-| Option                   | Description                                      | Example                                                     |
-| ------------------------ | ------------------------------------------------ | ----------------------------------------------------------- |
-| `--min-ratings-per-user` | Filter by minimum user activity                  | `python -m recsys.cli prepare --min-ratings-per-user 10`    |
-| `--loss`                 | Choose loss function (`warp`, `bpr`, `logistic`) | `python -m recsys.cli train --loss bpr`                     |
-| `--num-components`       | Set latent dimensionality                        | `python -m recsys.cli train --num-components 128`           |
-| `--export`               | Export recommendations to JSON                   | `python -m recsys.cli recommend 1 --k 5 --export recs.json` |
-
----
-
-## 🚧 Next Steps
-
-To extend or productionize this project:
-
-* 📊 Add offline evaluation dashboards (e.g., Jupyter or Streamlit).
-* 🧠 Track experiments with **MLflow** or **Weights & Biases**.
-* ⚡ Serve the trained model with **FastAPI** and expose a REST endpoint.
-* 🎥 Explore sequence-aware or contextual recommenders for richer insights.
-
----
-```
