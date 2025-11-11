@@ -1,141 +1,26 @@
-"""Utilities for downloading and preparing the MovieLens dataset."""
+"""Command-line interface for the MovieLens recommendation system."""
 from __future__ import annotations
 
 import json
-import logging
-import shutil
-import zipfile
-from dataclasses import dataclass
-from pathlib import Path
-from collections import Counter
-from typing import Dict, Iterable, List, Tuple
+from typing import Optional
 
-import pandas as pd
-import requests
-from lightfm.data import Dataset
-from scipy import sparse
-from tqdm import tqdm
+import typer
 
-from . import config
+from . import config, data, model
 
-LOGGER = logging.getLogger(__name__)
+DEFAULT_TRAINING_CONFIG = model.TrainingConfig()
+
+app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Utilities for preparing data, training models, and generating recommendations.",
+)
 
 
-@dataclass
-class PreparedData:
-    """Container for all artefacts required to train and evaluate the model."""
-
-    dataset: Dataset
-    train_interactions: sparse.coo_matrix
-    test_interactions: sparse.coo_matrix
-    item_features: sparse.csr_matrix
-    metadata: Dict[str, object]
-
-
-def _download_file(url: str, destination: Path) -> None:
-    """Download a file with progress bar."""
-    response = requests.get(url, stream=True, timeout=30)
-    response.raise_for_status()
-    total = int(response.headers.get("content-length", 0))
-    with open(destination, "wb") as file, tqdm(
-        total=total, unit="B", unit_scale=True, desc=destination.name
-    ) as progress:
-        for chunk in response.iter_content(chunk_size=8192):
-            file.write(chunk)
-            progress.update(len(chunk))
-
-
-def _filter_users(
-    ratings: pd.DataFrame, min_ratings_per_user: int, min_rating: float
-) -> pd.DataFrame:
-    """Filter users with few ratings and low scores."""
-    ratings = ratings[ratings["rating"] >= min_rating]
-    counts = ratings.groupby("userId")["movieId"].count()
-    valid_users = counts[counts >= min_ratings_per_user].index
-    filtered = ratings[ratings["userId"].isin(valid_users)]
-    return filtered
-
-
-def _train_test_split(ratings: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    ratings = ratings.sort_values(["userId", "timestamp"])
-    test = ratings.groupby("userId").tail(1)
-    train = ratings.drop(test.index)
-    return train, test
-
-
-def _extract_genre_features(movies: pd.DataFrame) -> Tuple[List[str], Iterable[Tuple[int, List[str]]]]:
-    all_genres = set()
-    item_features = []
-    for row in movies.itertuples(index=False):
-        genres = []
-        if isinstance(row.genres, str):
-            for genre in row.genres.split("|"):
-                genre = genre.strip()
-                if genre and genre.lower() != "(no genres listed)":
-                    feature = f"genre:{genre.lower()}"
-                    genres.append(feature)
-                    all_genres.add(feature)
-        item_features.append((row.movieId, genres))
-    return sorted(all_genres), item_features
-
-
-def _summarise_dataset(
-    filtered: pd.DataFrame,
-    train: pd.DataFrame,
-    test: pd.DataFrame,
-    movies: pd.DataFrame,
-) -> Dict[str, object]:
-    """Create high-level summary statistics for the prepared dataset."""
-
-    num_users = int(filtered["userId"].nunique())
-    num_items = int(filtered["movieId"].nunique())
-
-    rating_stats = filtered["rating"].agg(["min", "max", "mean", "median"])  # type: ignore[call-overload]
-    rating_summary = {
-        "min": float(rating_stats["min"]),
-        "max": float(rating_stats["max"]),
-        "mean": float(rating_stats["mean"]),
-        "median": float(rating_stats["median"]),
-    }
-
-    merged = filtered.merge(
-        movies[["movieId", "title", "genres"]], on="movieId", how="left"
-    )
-
-    genre_counter: Counter[str] = Counter()
-    for genres in merged["genres"].dropna():
-        for genre in str(genres).split("|"):
-            genre = genre.strip()
-            if genre and genre.lower() != "(no genres listed)":
-                genre_counter[genre] += 1
-
-    top_genres = [
-        {"genre": genre, "count": int(count)}
-        for genre, count in genre_counter.most_common(5)
-    ]
-
-    movie_counts = (
-        merged.groupby(["movieId", "title"], dropna=False)["rating"]
-        .count()
-        .sort_values(ascending=False)
-        .head(5)
-    )@app.command()
-def describe(as_json: bool = typer.Option(False, help="Emit dataset summary as JSON.")) -> None:
-    """Show descriptive statistics for the processed dataset."""
-    prepared = data.load_prepared_data()
-    summary = prepared.metadata.get("summary")
-    if summary is None:
-        typer.echo(
-            "Summary statistics are unavailable. Prepare the dataset to generate them."
-        )
-        raise typer.Exit(code=1)
-
-    if as_json:
-        typer.echo(json.dumps(summary, indent=2))
-        return
-
-    interactions = summary.get("interactions", {})
-    ratings = summary.get("rating_distribution", {})
+def _echo_summary(summary: dict[str, object]) -> None:
+    """Pretty-print a prepared dataset summary."""
+    interactions = summary.get("interactions", {}) if isinstance(summary, dict) else {}
+    ratings = summary.get("rating_distribution", {}) if isinstance(summary, dict) else {}
 
     typer.echo("Dataset summary:")
     typer.echo(f"  Users: {summary.get('users', 'unknown')}")
@@ -158,13 +43,13 @@ def describe(as_json: bool = typer.Option(False, help="Emit dataset summary as J
         typer.echo(f"  Matrix sparsity: {sparsity:.4f}")
 
     top_genres = summary.get("top_genres") or []
-    if top_genres:
+    if isinstance(top_genres, list) and top_genres:
         typer.echo("  Top genres:")
         for genre in top_genres:
             typer.echo(f"    {genre.get('genre')}: {genre.get('count')}")
 
     top_movies = summary.get("top_movies") or []
-    if top_movies:
+    if isinstance(top_movies, list) and top_movies:
         typer.echo("  Most-rated movies:")
         for movie in top_movies:
             typer.echo(
@@ -176,127 +61,210 @@ def describe(as_json: bool = typer.Option(False, help="Emit dataset summary as J
             )
 
 
-    top_movies = [
-        {
-            "movie_id": int(movie_id),
-            "title": title if isinstance(title, str) else "Unknown",
-            "ratings": int(count),
-        }
-        for (movie_id, title), count in movie_counts.items()
-    ]
+@app.command()
+def download(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Re-download and re-extract the MovieLens dataset even if it already exists.",
+    ),
+) -> None:
+    """Download the MovieLens dataset archive and extract it locally."""
+    dataset_dir = data.download_movielens(force=force)
+    typer.echo(f"MovieLens data available at {dataset_dir}")
 
-    total_interactions = int(filtered.shape[0])
-    train_interactions = int(train.shape[0])
-    test_interactions = int(test.shape[0])
 
-    sparsity = 1.0 - (
-        train_interactions / float(max(num_users * num_items, 1))
+@app.command()
+def prepare(
+    min_ratings_per_user: int = typer.Option(
+        config.DEFAULT_MIN_RATINGS_PER_USER,
+        help="Discard users with fewer than this many ratings.",
+    ),
+    min_rating: float = typer.Option(
+        config.DEFAULT_MIN_RATING,
+        help="Drop ratings below this threshold before training.",
+    ),
+    force_download: bool = typer.Option(
+        False,
+        "--force-download",
+        help="Force a fresh copy of the MovieLens archive before preparing data.",
+    ),
+) -> None:
+    """Prepare the MovieLens dataset and persist the processed artefacts."""
+    prepared = data.prepare_dataset(
+        min_ratings_per_user=min_ratings_per_user,
+        min_rating=min_rating,
+        force_download=force_download,
     )
-
-    return {
-        "users": num_users,
-        "items": num_items,
-        "interactions": {
-            "total": total_interactions,
-            "train": train_interactions,
-            "test": test_interactions,
-        },
-        "rating_distribution": rating_summary,
-        "sparsity": float(sparsity),
-        "top_genres": top_genres,
-        "top_movies": top_movies,
-    }
+    typer.echo("Prepared dataset saved to disk.")
+    summary = prepared.metadata.get("summary")
+    if isinstance(summary, dict):
+        _echo_summary(summary)
 
 
-def _build_dataset(
-    filtered: pd.DataFrame,
-    train: pd.DataFrame,
-    test: pd.DataFrame,
-    movies: pd.DataFrame,
-) -> PreparedData:
-    dataset = Dataset()
-
-    genres, item_feature_tuples = _extract_genre_features(movies)
-    dataset.fit(
-        users=train["userId"].unique(),
-        items=train["movieId"].unique(),
-        item_features=genres,
-    )
-
-    item_features = dataset.build_item_features(item_feature_tuples).tocsr()
-
-    def _build_interactions(frame: pd.DataFrame) -> sparse.coo_matrix:
-        interactions, _ = dataset.build_interactions(
-            (row.userId, row.movieId, float(row.rating))
-            for row in frame.itertuples(index=False)
+@app.command()
+def describe(
+    as_json: bool = typer.Option(False, help="Emit dataset summary as JSON."),
+) -> None:
+    """Display descriptive statistics for the processed dataset."""
+    prepared = data.load_prepared_data()
+    summary = prepared.metadata.get("summary")
+    if summary is None:
+        typer.echo(
+            "Summary statistics are unavailable. Prepare the dataset to generate them.",
+            err=True,
         )
-        return interactions.tocoo()
+        raise typer.Exit(code=1)
 
-    train_interactions = _build_interactions(train)
-    test_interactions = _build_interactions(test)
+    if as_json:
+        typer.echo(json.dumps(summary, indent=2))
+        return
 
-    user_id_map, user_feature_map, item_id_map, item_feature_map = dataset.mapping()
+    _echo_summary(summary)
 
-    metadata = {
-        "user_id_map": {str(key): int(value) for key, value in user_id_map.items()},
-        "item_id_map": {str(key): int(value) for key, value in item_id_map.items()},
-        "id_to_user": {str(int(value)): str(key) for key, value in user_id_map.items()},
-        "id_to_item": {str(int(value)): int(key) for key, value in item_id_map.items()},
-        "item_feature_map": {
-            str(key): value for key, value in item_feature_map.items()
-        },
-        "movie_titles": {
-            str(int(row.movieId)): row.title for row in movies.itertuples(index=False)
-        },
-        "movies": movies.to_dict(orient="records"),
-        "summary": _summarise_dataset(filtered, train, test, movies),
-    }
 
-    return PreparedData(
-        dataset=dataset,
-        train_interactions=train_interactions,
-        test_interactions=test_interactions,
-        item_features=item_features,
-        metadata=metadata,
+@app.command()
+def train(
+    loss: str = typer.Option(
+        DEFAULT_TRAINING_CONFIG.loss,
+        help="LightFM loss function (e.g. warp, bpr, logistic).",
+    ),
+    num_components: int = typer.Option(
+        DEFAULT_TRAINING_CONFIG.num_components,
+        help="Dimensionality of the latent representation.",
+    ),
+    learning_rate: float = typer.Option(
+        DEFAULT_TRAINING_CONFIG.learning_rate,
+        help="LightFM learning rate.",
+    ),
+    epochs: int = typer.Option(
+        DEFAULT_TRAINING_CONFIG.epochs,
+        help="Number of training epochs.",
+    ),
+    num_threads: int = typer.Option(
+        DEFAULT_TRAINING_CONFIG.num_threads,
+        help="Number of threads to use when fitting the model.",
+    ),
+    random_state: int = typer.Option(
+        DEFAULT_TRAINING_CONFIG.random_state,
+        help="Random seed for reproducibility.",
+    ),
+    model_path: Optional[Path] = typer.Option(
+        None,
+        help="Optional destination path for the trained model pickle.",
+        dir_okay=True,
+        file_okay=True,
+    ),
+    evaluate_after_training: bool = typer.Option(
+        True,
+        "--evaluate/--no-evaluate",
+        help="Evaluate the model on the test set after training completes.",
+    ),
+) -> None:
+    """Train a LightFM model on the prepared dataset."""
+    prepared = data.load_prepared_data()
+    training_config = model.TrainingConfig(
+        num_components=num_components,
+        learning_rate=learning_rate,
+        loss=loss,
+        epochs=epochs,
+        num_threads=num_threads,
+        random_state=random_state,
+    )
+    trained_model = model.train_model(prepared, training_config=training_config)
+
+    saved_path = model.save_model(trained_model, path=model_path)
+    typer.echo(f"Model saved to {saved_path}")
+
+    if evaluate_after_training:
+        results = model.evaluate_model(
+            trained_model,
+            prepared,
+            k=config.DEFAULT_TOP_K,
+            num_threads=num_threads,
+        )
+        typer.echo("Evaluation metrics:")
+        typer.echo(f"  Precision@{config.DEFAULT_TOP_K}: {results.precision_at_k:.4f}")
+        typer.echo(f"  Recall@{config.DEFAULT_TOP_K}: {results.recall_at_k:.4f}")
+        typer.echo(f"  AUC: {results.auc:.4f}")
+
+
+@app.command()
+def evaluate(
+    model_path: Optional[Path] = typer.Option(
+        None,
+        help="Path to a trained LightFM model (defaults to the last saved model).",
+    ),
+    k: int = typer.Option(
+        config.DEFAULT_TOP_K,
+        help="Evaluate recall@k and precision@k at this cut-off.",
+    ),
+    num_threads: int = typer.Option(
+        DEFAULT_TRAINING_CONFIG.num_threads,
+        help="Number of threads used for evaluation metrics.",
+    ),
+) -> None:
+    """Evaluate a trained model using the prepared test interactions."""
+    prepared = data.load_prepared_data()
+    trained_model = model.load_model(path=model_path)
+    results = model.evaluate_model(
+        trained_model,
+        prepared,
+        k=k,
+        num_threads=num_threads,
+    )
+    typer.echo("Evaluation metrics:")
+    typer.echo(f"  Precision@{k}: {results.precision_at_k:.4f}")
+    typer.echo(f"  Recall@{k}: {results.recall_at_k:.4f}")
+    typer.echo(f"  AUC: {results.auc:.4f}")
+
+
+@app.command()
+def recommend(
+    user_id: int = typer.Argument(..., help="External MovieLens user identifier."),
+    k: int = typer.Option(
+        config.DEFAULT_TOP_K,
+        help="Number of recommendations to generate.",
+    ),
+    model_path: Optional[Path] = typer.Option(
+        None,
+        help="Path to the trained LightFM model to use for inference.",
+    ),
+    export: Optional[Path] = typer.Option(
+        None,
+        help="Optional path to export the recommendations as JSON.",
+    ),
+) -> None:
+    """Generate top-N movie recommendations for a given user."""
+    prepared = data.load_prepared_data()
+    trained_model = model.load_model(path=model_path)
+
+    recommendations = model.recommend_for_user(
+        trained_model,
+        prepared,
+        user_id=user_id,
+        k=k,
     )
 
+    if not recommendations:
+        typer.echo("No recommendations available for this user.")
+        return
 
-def prepare_dataset(
-    min_ratings_per_user: int = config.DEFAULT_MIN_RATINGS_PER_USER,
-    min_rating: float = config.DEFAULT_MIN_RATING,
-    force_download: bool = False,
-) -> PreparedData:
-    """Prepare the MovieLens dataset for training."""
-    dataset_dir = download_movielens(force=force_download)
-
-    ratings = _load_ratings(dataset_dir)
-    movies = pd.read_csv(dataset_dir / "movies.csv")
-
-    filtered = _filter_users(ratings, min_ratings_per_user, min_rating)
-    train, test = _train_test_split(filtered)
-
-    prepared = _build_dataset(filtered, train, test, movies)
-
-    _persist_prepared_data(prepared)
-    return prepared
-
-
-def _persist_prepared_data(prepared: PreparedData) -> None:
-    config.ensure_directories()
-    sparse.save_npz(config.PROCESSED_DATA_DIR / "train_interactions.npz", prepared.train_interactions)
-    sparse.save_npz(config.PROCESSED_DATA_DIR / "test_interactions.npz", prepared.test_interactions)
-    sparse.save_npz(config.PROCESSED_DATA_DIR / "item_features.npz", prepared.item_features)
-
-    metadata_path = config.PROCESSED_DATA_DIR / "metadata.json"
-    with open(metadata_path, "w", encoding="utf-8") as file:
-        json.dump(prepared.metadata, file, indent=2)
-
-
-def load_prepared_data() -> PreparedData:
-    """Load prepared artefacts from disk."""
-    config.ensure_directories()
-    metadata_path = config.PROCESSED_DATA_DIR / "metadata.json"
-    if not metadata_path.exists():
-        raise FileNotFoundError(
-            "Processed data not found. Run the 'prepare' command first."
+    typer.echo(f"Top {len(recommendations)} recommendations for user {user_id}:")
+    for index, item in enumerate(recommendations, start=1):
+        typer.echo(
+            "  {idx}. {title} (movie_id={movie_id}) – score={score:.4f}".format(
+                idx=index,
+                title=item.get("title"),
+                movie_id=item.get("movie_id"),
+                score=item.get("score", 0.0),
+            )
         )
+
+    if export is not None:
+        model.export_recommendations(recommendations, export)
+        typer.echo(f"Recommendations exported to {export}")
+
+
+if __name__ == "__main__":  # pragma: no cover - entrypoint convenience
+    app()
