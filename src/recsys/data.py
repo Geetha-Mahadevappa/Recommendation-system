@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import zipfile
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -32,43 +33,40 @@ class PreparedData:
 
 
 def _download_file(url: str, destination: Path) -> None:
-    response = requests.get(url, stream=True, timeout=60)
+    """Download a file with progress bar."""
+    response = requests.get(url, stream=True, timeout=30)
     response.raise_for_status()
     total = int(response.headers.get("content-length", 0))
     with open(destination, "wb") as file, tqdm(
-        total=total,
-        unit="B",
-        unit_scale=True,
-        desc=f"Downloading {destination.name}",
+        total=total, unit="B", unit_scale=True, desc=destination.name
     ) as progress:
         for chunk in response.iter_content(chunk_size=8192):
-            if chunk:
-                file.write(chunk)
-                progress.update(len(chunk))
+            file.write(chunk)
+            progress.update(len(chunk))
 
 
 def download_movielens(force: bool = False) -> Path:
-    """Download and extract the MovieLens small dataset."""
-    config.ensure_directories()
-    archive_path = config.RAW_DATA_DIR / config.MOVIELENS_ARCHIVE_NAME
-    dataset_dir = config.RAW_DATA_DIR / config.MOVIELENS_DIR_NAME
+    """Download and extract the MovieLens dataset."""
+    dataset_dir = config.DATA_DIR / "movielens"
+    dataset_dir.mkdir(parents=True, exist_ok=True)
 
-    if force and archive_path.exists():
-        archive_path.unlink()
-    if force and dataset_dir.exists():
-        shutil.rmtree(dataset_dir)
+    archive_path = dataset_dir / "ml-latest-small.zip"
+    extracted_dir = dataset_dir / "ml-latest-small"
 
-    if not dataset_dir.exists():
-        if not archive_path.exists():
-            LOGGER.info("Downloading MovieLens data from %s", config.MOVIELENS_URL)
-            _download_file(config.MOVIELENS_URL, archive_path)
-        LOGGER.info("Extracting MovieLens archive to %s", dataset_dir)
-        with zipfile.ZipFile(archive_path, "r") as archive:
-            archive.extractall(config.RAW_DATA_DIR)
-    else:
-        LOGGER.info("MovieLens dataset already present at %s", dataset_dir)
+    if extracted_dir.exists() and not force:
+        LOGGER.info("MovieLens dataset already extracted.")
+        return extracted_dir
 
-    return dataset_dir
+    url = config.MOVIELENS_URL
+    LOGGER.info("Downloading MovieLens dataset from %s", url)
+    _download_file(url, archive_path)
+
+    LOGGER.info("Extracting MovieLens dataset...")
+    with zipfile.ZipFile(archive_path, "r") as zip_ref:
+        zip_ref.extractall(dataset_dir)
+
+    LOGGER.info("Dataset ready at %s", extracted_dir)
+    return extracted_dir
 
 
 def _load_ratings(dataset_dir: Path) -> pd.DataFrame:
@@ -99,7 +97,9 @@ def _train_test_split(ratings: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     return train, test
 
 
-def _extract_genre_features(movies: pd.DataFrame) -> Tuple[List[str], Iterable[Tuple[int, List[str]]]]:
+def _extract_genre_features(
+    movies: pd.DataFrame,
+) -> Tuple[List[str], Iterable[Tuple[int, List[str]]]]:
     all_genres = set()
     item_features = []
     for row in movies.itertuples(index=False):
@@ -115,7 +115,82 @@ def _extract_genre_features(movies: pd.DataFrame) -> Tuple[List[str], Iterable[T
     return sorted(all_genres), item_features
 
 
+def _summarise_dataset(
+    filtered: pd.DataFrame,
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    movies: pd.DataFrame,
+) -> Dict[str, object]:
+    """Create high-level summary statistics for the prepared dataset."""
+
+    num_users = int(filtered["userId"].nunique())
+    num_items = int(filtered["movieId"].nunique())
+
+    rating_stats = filtered["rating"].agg(["min", "max", "mean", "median"])  # type: ignore[call-overload]
+    rating_summary = {
+        "min": float(rating_stats["min"]),
+        "max": float(rating_stats["max"]),
+        "mean": float(rating_stats["mean"]),
+        "median": float(rating_stats["median"]),
+    }
+
+    merged = filtered.merge(
+        movies[["movieId", "title", "genres"]], on="movieId", how="left"
+    )
+
+    genre_counter: Counter[str] = Counter()
+    for genres in merged["genres"].dropna():
+        for genre in str(genres).split("|"):
+            genre = genre.strip()
+            if genre and genre.lower() != "(no genres listed)":
+                genre_counter[genre] += 1
+
+    top_genres = [
+        {"genre": genre, "count": int(count)}
+        for genre, count in genre_counter.most_common(5)
+    ]
+
+    movie_counts = (
+        merged.groupby(["movieId", "title"], dropna=False)["rating"]
+        .count()
+        .sort_values(ascending=False)
+        .head(5)
+    )
+
+    top_movies = [
+        {
+            "movie_id": int(movie_id),
+            "title": title if isinstance(title, str) else "Unknown",
+            "ratings": int(count),
+        }
+        for (movie_id, title), count in movie_counts.items()
+    ]
+
+    total_interactions = int(filtered.shape[0])
+    train_interactions = int(train.shape[0])
+    test_interactions = int(test.shape[0])
+
+    sparsity = 1.0 - (
+        train_interactions / float(max(num_users * num_items, 1))
+    )
+
+    return {
+        "users": num_users,
+        "items": num_items,
+        "interactions": {
+            "total": total_interactions,
+            "train": train_interactions,
+            "test": test_interactions,
+        },
+        "rating_distribution": rating_summary,
+        "sparsity": float(sparsity),
+        "top_genres": top_genres,
+        "top_movies": top_movies,
+    }
+
+
 def _build_dataset(
+    filtered: pd.DataFrame,
     train: pd.DataFrame,
     test: pd.DataFrame,
     movies: pd.DataFrame,
@@ -155,6 +230,7 @@ def _build_dataset(
             str(int(row.movieId)): row.title for row in movies.itertuples(index=False)
         },
         "movies": movies.to_dict(orient="records"),
+        "summary": _summarise_dataset(filtered, train, test, movies),
     }
 
     return PreparedData(
@@ -180,7 +256,7 @@ def prepare_dataset(
     filtered = _filter_users(ratings, min_ratings_per_user, min_rating)
     train, test = _train_test_split(filtered)
 
-    prepared = _build_dataset(train, test, movies)
+    prepared = _build_dataset(filtered, train, test, movies)
 
     _persist_prepared_data(prepared)
     return prepared
@@ -206,24 +282,14 @@ def load_prepared_data() -> PreparedData:
             "Processed data not found. Run the 'prepare' command first."
         )
 
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    train_interactions = sparse.load_npz(
-        config.PROCESSED_DATA_DIR / "train_interactions.npz"
-    ).tocoo()
-    test_interactions = sparse.load_npz(
-        config.PROCESSED_DATA_DIR / "test_interactions.npz"
-    ).tocoo()
-    item_features = sparse.load_npz(
-        config.PROCESSED_DATA_DIR / "item_features.npz"
-    ).tocsr()
+    train_interactions = sparse.load_npz(config.PROCESSED_DATA_DIR / "train_interactions.npz")
+    test_interactions = sparse.load_npz(config.PROCESSED_DATA_DIR / "test_interactions.npz")
+    item_features = sparse.load_npz(config.PROCESSED_DATA_DIR / "item_features.npz")
+
+    with open(metadata_path, "r", encoding="utf-8") as file:
+        metadata = json.load(file)
 
     dataset = Dataset()
-    dataset.fit(
-        users=list(metadata["user_id_map"].keys()),
-        items=list(metadata["item_id_map"].keys()),
-        item_features=list(metadata.get("item_feature_map", {}).keys()),
-    )
-
     return PreparedData(
         dataset=dataset,
         train_interactions=train_interactions,
